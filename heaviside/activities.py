@@ -497,7 +497,6 @@ def fanout_sqs_nonblocking(args, session=None, queue=None, queue_name=None):
     results = args['results']
 
     jobid_arn_map = args['jobid_arn_map']
-    jobid = args['jobid']
 
     handling_exception = True # Detect if we need to stop all running executions
 
@@ -529,7 +528,7 @@ def fanout_sqs_nonblocking(args, session=None, queue=None, queue_name=None):
                     arn = jobid_arn_map.pop(msg_jobid)
                     still_running.remove(arn)
                 else:
-                    log.debug("Duplicate jobid: {}".format(msg_jobid))
+                    log.debug("Jobid not found: {}".format(msg_jobid))
                 message.delete()
 
 
@@ -551,12 +550,12 @@ def fanout_sqs_nonblocking(args, session=None, queue=None, queue_name=None):
             elif len(common_sub_args) > 0:
                 log.warning("common_sub_args ignored because sub_args is not a dict")
             try:
-                jobid += 1
-                sfn_inputs['jobid'] = jobid
+                args['jobid'] += 1
+                sfn_inputs['jobid'] = args['jobid']
                 sfn_inputs['sqs'] = queue_name
                 arn = sfn.launch(sfn_inputs)
                 running.append(arn)
-                jobid_arn_map[jobid] = arn 
+                jobid_arn_map[args['jobid']] = arn
                 sub_args.pop(0)
             except sfn.client.exceptions.ExecutionAlreadyExists:
                 # Don't kill running step functions if accidentally reuse name
