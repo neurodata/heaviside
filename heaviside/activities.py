@@ -417,8 +417,10 @@ def fanout_sqs(session, sub_sfn, sub_args, max_concurrent=50, rampup_delay=15, r
         'finished': False,
         'running': [],
         'results': [],
-        'jobid_arn_map': {},
-        'jobid' : 1
+        'job_details': {},
+        'jobid' : 1,
+        'job_timeout' : 60,     # Timeout before a task is assumed failed 
+        'job_retries' : 5       # Number of times to retry a task
     }
 
     # Get the service resource
@@ -427,9 +429,10 @@ def fanout_sqs(session, sub_sfn, sub_args, max_concurrent=50, rampup_delay=15, r
 
     queue_name = '{}_{}_{}'.format("Downsample", datetime.now().strftime("%Y%m%d%H%M%s%f"), random.randint(0,9999))
     queue = sqs.create_queue(QueueName=queue_name)
+    args['queue_name'] = queue_name
 
     while True:
-        args = fanout_sqs_nonblocking(args, session, queue, queue_name)
+        args = fanout_sqs_nonblocking(args, session, queue)
 
         if args['finished']:
             return args['results']
@@ -437,7 +440,7 @@ def fanout_sqs(session, sub_sfn, sub_args, max_concurrent=50, rampup_delay=15, r
         time.sleep(poll_delay)
     queue.delete()
 
-def fanout_sqs_nonblocking(args, session=None, queue=None, queue_name=None):
+def fanout_sqs_nonblocking(args, session=None, queue=None):
     """Helper method for executing a dynamic number of StepFunctions and
     returning the results.
 
@@ -482,6 +485,7 @@ def fanout_sqs_nonblocking(args, session=None, queue=None, queue_name=None):
     rampup_delay = args['rampup_delay']
     rampup_backoff = args['rampup_backoff']
     status_delay = args['status_delay']
+    queue_name = args['queue_name']
 
     have_full_arn = False
     if 'sub_sfn_is_full_arn' in args:
@@ -496,7 +500,10 @@ def fanout_sqs_nonblocking(args, session=None, queue=None, queue_name=None):
     running = args['running']
     results = args['results']
 
-    jobid_arn_map = args['jobid_arn_map']
+    job_details = args['job_details']
+    job_timeout = args['job_timeout']
+    job_retries = args['job_retries']
+
 
     handling_exception = True # Detect if we need to stop all running executions
 
@@ -524,12 +531,31 @@ def fanout_sqs_nonblocking(args, session=None, queue=None, queue_name=None):
                 break
             for message in messages:
                 msg_jobid = int(message.body)
-                if msg_jobid in jobid_arn_map:
-                    arn = jobid_arn_map.pop(msg_jobid)
-                    still_running.remove(arn)
+                if msg_jobid in job_details:
+                    (arns, _, _, _) = job_details.pop(msg_jobid)
+                    for arn in arns:
+                        still_running.remove(arn)
                 else:
                     log.debug("Jobid not found: {}".format(msg_jobid))
                 message.delete()
+
+        # Check to see if we have any long-running unfinished tasks
+        current_time = datetime.now()
+        for jobid in job_details:
+            (arns, sfn_inputs, start_time, retries) = job_details[jobid]
+            if (current_time - start_time).total_seconds() > job_timeout:
+                if retries < job_retries:
+                    try:
+                        log.debug("Timeout on job id {}. Retrying.".format(jobid))
+                        arn = sfn.launch(sfn_inputs)
+                        running.append(arn)
+                        job_details[args[jobid]] = (arns.append(arn), sfn_inputs, datetime.now(), retries+1)
+                    except ClientError as ex:
+                        # Don't kill running step functions when throttled
+                        if ex.response["Error"]["Code"] == "ThrottlingException":
+                            handling_exception = False
+                        elif ex.response["Error"]["Code"] == "TooManyRequestsException":
+                            handling_exception = False
 
 
         log.debug("Sub-processes finished: {}".format(len(running) - len(still_running)))
@@ -555,7 +581,7 @@ def fanout_sqs_nonblocking(args, session=None, queue=None, queue_name=None):
                 sfn_inputs['sqs'] = queue_name
                 arn = sfn.launch(sfn_inputs)
                 running.append(arn)
-                jobid_arn_map[args['jobid']] = arn
+                job_details[args['jobid']] = ([arn], sfn_inputs, datetime.now(), 0)
                 sub_args.pop(0)
             except sfn.client.exceptions.ExecutionAlreadyExists:
                 # Don't kill running step functions if accidentally reuse name
