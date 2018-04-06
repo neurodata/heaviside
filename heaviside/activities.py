@@ -420,7 +420,7 @@ def fanout_sqs(session, sub_sfn, sub_args, max_concurrent=50, rampup_delay=15, r
         'job_details': {},
         'jobid' : 1,
         'job_timeout' : 60,     # Timeout before a task is assumed failed 
-        'job_retries' : 5       # Number of times to retry a task
+        'job_retries' : 10      # Number of times to retry a task
     }
 
     # Get the service resource
@@ -526,7 +526,7 @@ def fanout_sqs_nonblocking(args, session=None, queue=None):
 
 
         while 1:
-            messages = queue.receive_messages(MaxNumberOfMessages=10, WaitTimeSeconds=5)
+            messages = queue.receive_messages(MaxNumberOfMessages=10, WaitTimeSeconds=2)
             if len(messages) == 0:
                 break
             for message in messages:
@@ -534,10 +534,17 @@ def fanout_sqs_nonblocking(args, session=None, queue=None):
                 if msg_jobid in job_details:
                     (arns, _, _, _) = job_details.pop(msg_jobid)
                     for arn in arns:
-                        still_running.remove(arn)
+                        if arn in still_running:
+                            still_running.remove(arn)
+                        else:
+                            log.debug("ARN {} not found in still_running".format(arn))
                 else:
                     log.debug("Jobid not found: {}".format(msg_jobid))
                 message.delete()
+
+        log.debug("Sub-processes finished: {}".format(len(running) - len(still_running)))
+        log.debug("Sub-processes running: {}".format(len(still_running)))
+        running = args['running'] = still_running
 
         # Check to see if we have any long-running unfinished tasks
         current_time = datetime.now()
@@ -549,7 +556,8 @@ def fanout_sqs_nonblocking(args, session=None, queue=None):
                         log.debug("Timeout on job id {}. Retrying.".format(jobid))
                         arn = sfn.launch(sfn_inputs)
                         running.append(arn)
-                        job_details[args[jobid]] = (arns.append(arn), sfn_inputs, datetime.now(), retries+1)
+                        arns.append(arn)
+                        job_details[jobid] = (arns, sfn_inputs, datetime.now(), retries+1)
                     except ClientError as ex:
                         # Don't kill running step functions when throttled
                         if ex.response["Error"]["Code"] == "ThrottlingException":
@@ -557,10 +565,6 @@ def fanout_sqs_nonblocking(args, session=None, queue=None):
                         elif ex.response["Error"]["Code"] == "TooManyRequestsException":
                             handling_exception = False
 
-
-        log.debug("Sub-processes finished: {}".format(len(running) - len(still_running)))
-        log.debug("Sub-processes running: {}".format(len(still_running)))
-        running = args['running'] = still_running
 
         if error is not None:
             raise error
